@@ -1,0 +1,41 @@
+# 🧠 FAISS + index artifacts
+faiss.index
+id_map.json
+*.npy
+*.npz
+
+# 🔁 Local dev scripts / data dumps
+*.log
+*.csv
+*.tsv
+*.sqlite
+*.db
+
+# 📦 Python artifacts
+__pycache__/
+*.py[cod]
+*.so
+
+# 🧪 Virtual environment
+venv/
+.env
+.env.*
+
+# 📥 Model caches (SentenceTransformers, Hugging Face)
+.cache/
+*.ckpt
+*.pt
+*.bin
+*.onnx
+
+# 🧪 Jupyter/colab scratch
+.ipynb_checkpoints/
+
+# 🧹 OS + editor junk
+.DS_Store
+*.swp
+*.swo
+*.bak
+
+# 🌐 VS Code settings (optional)
+.vscode/
