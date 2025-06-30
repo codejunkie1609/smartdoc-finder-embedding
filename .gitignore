@@ -4,6 +4,9 @@ id_map.json
 *.npy
 *.npz
 
+beir/*
+.venv/*
+
 # 🔁 Local dev scripts / data dumps
 *.log
 *.csv

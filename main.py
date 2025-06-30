@@ -9,11 +9,11 @@ import json
 
 app = FastAPI()
 
-model = SentenceTransformer("intfloat/e5-small-v2")
+model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 
 try:
-    index = faiss.read_index("faiss.index")
-    index_to_id = json.load(open("id_map.json"))
+    index = faiss.read_index("index/faiss.index")
+    index_to_id = json.load(open("index/id_map.json"))
     print(f"✅ FAISS index loaded with {index.ntotal} vectors.")
 except Exception as e:
     print(f"❌ Error loading FAISS index: {e}")
@@ -27,9 +27,6 @@ class MultiEmbedResponse(BaseModel):
     base: List[float]
     sub: List[List[float]]
 
-@app.get("/ping")
-def ping():
-    return {"status": "ok"}
 
 @app.post("/multi-embed", response_model=MultiEmbedResponse)
 def multi_embed(req: EmbedRequest):
@@ -52,7 +49,9 @@ def semantic_search(req: dict):
         return {"hits": []}
 
     query_vec = np.array(req["vector"]).astype("float32")
-    D, I = index.search(query_vec.reshape(1, -1), 5)
+    
+    D, I = index.search(query_vec.reshape(1, -1), 100)
+
 
     hits = []
     for idx, score in zip(I[0], D[0]):
