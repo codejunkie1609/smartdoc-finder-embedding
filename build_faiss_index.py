@@ -25,7 +25,7 @@ DB_CONFIG = {
     "dbname": "smartdoc",
     "user": "smartdoc_user",
     "password": "password",
-    "host": "localhost",
+    "host": "db",
     "port": 5432
 }
 
