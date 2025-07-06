@@ -1,80 +1,74 @@
-import os
-os.environ["OMP_NUM_THREADS"] = "1"      # OpenMP
-os.environ["OPENBLAS_NUM_THREADS"] = "1" # numpy / scipy
-os.environ["MKL_NUM_THREADS"] = "1"      # Intel MKL
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"  # macOS Accelerate
-os.environ["NUMEXPR_NUM_THREADS"] = "1"  # numexpr
+
 
 import warnings
 warnings.filterwarnings("ignore")
+
 import json
+import os
 import faiss
 import numpy as np
 import psycopg2
-from tqdm import tqdm
+import sys
+from tqdm_loggable.auto import tqdm
 from sentence_transformers import SentenceTransformer
+import logging
 
-# Config
+# ✅ Config
+logging.basicConfig(level=logging.INFO)
 MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 INDEX_DIR = "index"
 INDEX_STATE_FILE = f"{INDEX_DIR}/index_state.json"
-BATCH_SIZE = 16  # Reduced for stability
+BATCH_SIZE = 16
 FAISS_ADD_CHUNK = 1000
 
 DB_CONFIG = {
     "dbname": "smartdoc",
-    "user": "smartdoc_user",
-    "password": "password",
+    "user": "postgres",
+    "password": "postgres",
     "host": "db",
     "port": 5432
 }
 
-# 1. Init model and FAISS
+# ✅ Initialize model & FAISS
 model = SentenceTransformer(MODEL_NAME, device="cpu")
 DIM = model.get_sentence_embedding_dimension()
 index = faiss.IndexFlatIP(DIM)
 index_to_id = {}
 
-# 2. Load index state
+# ✅ Load existing index state
 index_state = {"indexed_doc_ids": []}
 if os.path.exists(INDEX_STATE_FILE):
     with open(INDEX_STATE_FILE, "r") as f:
         index_state = json.load(f)
 indexed_doc_ids = set(index_state.get("indexed_doc_ids", []))
 
-# 3. Connect to database
+# ✅ Connect to DB
 conn = psycopg2.connect(**DB_CONFIG)
 cur = conn.cursor()
 
-# 4. Fetch new, unindexed documents
-cur.execute(
-    """
+# ✅ Fetch documents
+cur.execute("""
     SELECT id::text, content 
     FROM documents 
     WHERE content IS NOT NULL 
     AND content != '' 
     AND length(content) < 10000
-    """
-)
+""")
 rows = cur.fetchall()
 rows = [row for row in rows if row[0] not in indexed_doc_ids]
 print(f"Found {len(rows)} new documents to index.")
 
-# 5. Batched embedding and indexing
+# ✅ Embedding loop
 all_embeddings = []
 all_doc_ids = []
 
-for i in tqdm(range(0, len(rows), BATCH_SIZE), desc="Embedding documents"):
+for i in tqdm(range(0, len(rows), BATCH_SIZE), desc="Embedding documents",file=sys.stdout, dynamic_ncols=True):
     batch = rows[i:i + BATCH_SIZE]
     batch_ids = [doc_id for doc_id, _ in batch]
     batch_texts = [content for _, content in batch]
 
     try:
-        batch_vectors = model.encode(
-            batch_texts, 
-            batch_size=BATCH_SIZE, 
-            show_progress_bar=False
-        )
+        batch_vectors = model.encode(batch_texts, batch_size=BATCH_SIZE, show_progress_bar=False)
     except Exception as e:
         print(f"❌ Embedding error at batch {i}-{i + BATCH_SIZE}: {e}")
         continue
@@ -83,7 +77,7 @@ for i in tqdm(range(0, len(rows), BATCH_SIZE), desc="Embedding documents"):
     all_doc_ids.extend(batch_ids)
     indexed_doc_ids.update(batch_ids)
 
-# 6. Add to FAISS in chunks
+# ✅ Add to FAISS
 os.makedirs(INDEX_DIR, exist_ok=True)
 
 for i in tqdm(range(0, len(all_embeddings), FAISS_ADD_CHUNK), desc="Adding to FAISS index"):
@@ -94,18 +88,19 @@ for i in tqdm(range(0, len(all_embeddings), FAISS_ADD_CHUNK), desc="Adding to FA
         global_index = i + j
         index_to_id[str(global_index)] = all_doc_ids[global_index]
 
-# 7. Save index and ID map
+# ✅ Save index & mappings
 faiss.write_index(index, f"{INDEX_DIR}/faiss.index")
 with open(f"{INDEX_DIR}/id_map.json", "w") as f:
     json.dump(index_to_id, f)
+
 print(f"✅ Indexed {len(all_doc_ids)} documents. FAISS total: {index.ntotal}")
 
-# 8. Save updated index state
+# ✅ Save updated index state
 index_state["indexed_doc_ids"] = list(indexed_doc_ids)
 with open(INDEX_STATE_FILE, "w") as f:
     json.dump(index_state, f)
 
-# 9. Cleanup
+# ✅ Cleanup
 cur.close()
 conn.close()
 print("✅ Indexing complete.")

@@ -4,3 +4,5 @@ faiss-cpu
 sentence-transformers
 numpy
 scikit-learn
+psycopg2-binary
+tqdm_loggable

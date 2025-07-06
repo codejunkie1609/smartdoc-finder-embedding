@@ -12,8 +12,8 @@ app = FastAPI()
 model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 
 try:
-    index = faiss.read_index("index/faiss.index")
-    index_to_id = json.load(open("index/id_map.json"))
+    index = faiss.read_index("/app/index/faiss.index")
+    index_to_id = json.load(open("/app/index/id_map.json"))
     print(f"✅ FAISS index loaded with {index.ntotal} vectors.")
 except Exception as e:
     print(f"❌ Error loading FAISS index: {e}")
