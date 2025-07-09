@@ -1,67 +1,86 @@
-from fastapi import FastAPI
+# In your embedding API file (e.g., main.py)
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from typing import List
-import re
 import numpy as np
 import faiss
 import json
+import os
+import logging
 
+# --- Setup ---
 app = FastAPI()
-
+logging.basicConfig(level=logging.INFO)
 model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 
-try:
-    index = faiss.read_index("/app/index/faiss.index")
-    index_to_id = json.load(open("/app/index/id_map.json"))
-    print(f"✅ FAISS index loaded with {index.ntotal} vectors.")
-except Exception as e:
-    print(f"❌ Error loading FAISS index: {e}")
-    index = None
-    index_to_id = {}
+# --- Global state for the index ---
+INDEX_FILE_PATH = "/app/index/faiss.index"
+ID_MAP_FILE_PATH = "/app/index/id_map.json"
 
+# We start with an empty index in memory
+index = None
+index_to_id = {}
+last_modified_time = 0
+
+def load_index():
+    """Loads the FAISS index and ID map from disk if they exist and have been updated."""
+    global index, index_to_id, last_modified_time
+    try:
+        if os.path.exists(INDEX_FILE_PATH):
+            current_mod_time = os.path.getmtime(INDEX_FILE_PATH)
+            # Only reload if the file has changed
+            if current_mod_time > last_modified_time:
+                logging.info("Detected change in index file. Reloading...")
+                index = faiss.read_index(INDEX_FILE_PATH)
+                with open(ID_MAP_FILE_PATH, 'r') as f:
+                    index_to_id = json.load(f)
+                last_modified_time = current_mod_time
+                logging.info(f"✅ FAISS index reloaded with {index.ntotal} vectors.")
+    except Exception as e:
+        logging.error(f"❌ Error reloading FAISS index: {e}")
+        index = None # Reset on failure
+
+# --- Pydantic Models ---
 class EmbedRequest(BaseModel):
     text: str
 
-class MultiEmbedResponse(BaseModel):
-    base: List[float]
-    sub: List[List[float]]
+class SemanticSearchRequest(BaseModel):
+    vector: List[float]
 
+# --- API Endpoints ---
+@app.on_event("startup")
+def startup_event():
+    """Attempt to load the index once at startup."""
+    load_index()
 
-@app.post("/multi-embed", response_model=MultiEmbedResponse)
+@app.post("/multi-embed")
 def multi_embed(req: EmbedRequest):
-    clean_text = req.text.strip()
-    base = model.encode(["query: " + clean_text])[0]
-
-    parts = re.split(r"[,.?!;]", clean_text)
-    parts = [p.strip() for p in parts if len(p.strip()) > 3]
-    sub_inputs = ["query: " + p for p in parts]
-    sub_embeds = model.encode(sub_inputs) if parts else []
-
-    return MultiEmbedResponse(
-        base=base.tolist(),
-        sub=[e.tolist() for e in sub_embeds]
-    )
+    base = model.encode([req.text])[0]
+    return {"base": base.tolist()}
 
 @app.post("/semantic-search")
-def semantic_search(req: dict):
-    if index is None:
+def semantic_search(req: SemanticSearchRequest):
+    # ✅ This check now happens at the time of the search request
+    load_index()
+
+    if index is None or index.ntotal == 0:
+        logging.warning("Search attempted but FAISS index is not loaded or is empty.")
         return {"hits": []}
 
-    query_vec = np.array(req["vector"]).astype("float32")
+    query_vec = np.array(req.vector).astype("float32").reshape(1, -1)
     
-    D, I = index.search(query_vec.reshape(1, -1), 100)
-
+    try:
+        D, I = index.search(query_vec, 100)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"FAISS search failed: {e}")
 
     hits = []
     for idx, score in zip(I[0], D[0]):
-        if idx == -1:
-            continue
         key = str(int(idx))
-        if key not in index_to_id:
-            print(f"⚠️ FAISS idx {idx} not in ID map")
-            continue
-        doc_id = index_to_id[key]
-        hits.append({"docId": doc_id, "score": float(score)})
+        if key in index_to_id:
+            doc_id = index_to_id[key]
+            hits.append({"docId": doc_id, "score": float(score)})
 
     return {"hits": hits}

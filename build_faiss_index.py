@@ -1,106 +1,147 @@
+import debugpy
 
+# Start a debug server on port 5678, accessible from any IP
+debugpy.listen(("0.0.0.0", 5678))
+print("🚀 Debugpy is listening. Waiting for debugger to attach...")
+debugpy.wait_for_client()
+print("✅ Debugger attached.")
 
-import warnings
-warnings.filterwarnings("ignore")
-
+import pika
 import json
 import os
 import faiss
 import numpy as np
-import psycopg2
-import sys
-from tqdm_loggable.auto import tqdm
 from sentence_transformers import SentenceTransformer
 import logging
+import time
 
-# ✅ Config
-logging.basicConfig(level=logging.INFO)
+# --- Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s:%(name)s: %(message)s')
 MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-INDEX_DIR = "index"
-INDEX_STATE_FILE = f"{INDEX_DIR}/index_state.json"
-BATCH_SIZE = 16
-FAISS_ADD_CHUNK = 1000
+INDEX_DIR = "/app/index"
+RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
+QUEUE_NAME = "embedding.jobs"
+BATCH_SIZE = 32
+BATCH_TIMEOUT = 5.0
 
-DB_CONFIG = {
-    "dbname": "smartdoc",
-    "user": "postgres",
-    "password": "postgres",
-    "host": "db",
-    "port": 5432
-}
-
-# ✅ Initialize model & FAISS
+# --- Initialize Model and FAISS Index ---
+logging.info(f"Loading sentence transformer model: {MODEL_NAME}")
 model = SentenceTransformer(MODEL_NAME, device="cpu")
 DIM = model.get_sentence_embedding_dimension()
-index = faiss.IndexFlatIP(DIM)
+
+faiss_index_path = f"{INDEX_DIR}/faiss.index"
+id_map_path = f"{INDEX_DIR}/id_map.json"
+index = None
 index_to_id = {}
 
-# ✅ Load existing index state
-index_state = {"indexed_doc_ids": []}
-if os.path.exists(INDEX_STATE_FILE):
-    with open(INDEX_STATE_FILE, "r") as f:
-        index_state = json.load(f)
-indexed_doc_ids = set(index_state.get("indexed_doc_ids", []))
+if os.path.exists(faiss_index_path):
+    logging.info(f"Loading existing FAISS index from {faiss_index_path}")
+    index = faiss.read_index(faiss_index_path)
+    with open(id_map_path, 'r') as f:
+        index_to_id = json.load(f)
+else:
+    logging.info("No existing FAISS index found, creating a new one.")
+    index = faiss.IndexFlatIP(DIM)
+    os.makedirs(INDEX_DIR, exist_ok=True)
 
-# ✅ Connect to DB
-conn = psycopg2.connect(**DB_CONFIG)
-cur = conn.cursor()
 
-# ✅ Fetch documents
-cur.execute("""
-    SELECT id::text, content 
-    FROM documents 
-    WHERE content IS NOT NULL 
-    AND content != '' 
-    AND length(content) < 10000
-""")
-rows = cur.fetchall()
-rows = [row for row in rows if row[0] not in indexed_doc_ids]
-print(f"Found {len(rows)} new documents to index.")
+# --- Batch Processing Logic ---
+message_batch = []
 
-# ✅ Embedding loop
-all_embeddings = []
-all_doc_ids = []
+def process_batch():
+    """Processes the entire global message_batch."""
+    global message_batch
+    if not message_batch:
+        return
 
-for i in tqdm(range(0, len(rows), BATCH_SIZE), desc="Embedding documents",file=sys.stdout, dynamic_ncols=True):
-    batch = rows[i:i + BATCH_SIZE]
-    batch_ids = [doc_id for doc_id, _ in batch]
-    batch_texts = [content for _, content in batch]
+    batch_len = len(message_batch)
+    logging.info(f"Processing batch of {batch_len} messages...")
+    
+    delivery_tags = [item['method'].delivery_tag for item in message_batch]
+    texts_to_encode = [item['message']['content'] for item in message_batch]
+    
+    # ✅ CORRECTED: Changed 'id' to 'documentId' to match the incoming JSON
+    doc_ids = [item['message']['documentId'] for item in message_batch]
 
     try:
-        batch_vectors = model.encode(batch_texts, batch_size=BATCH_SIZE, show_progress_bar=False)
+        logging.info(f"[{batch_len} docs] Encoding texts...")
+        vectors = model.encode(texts_to_encode, batch_size=BATCH_SIZE, show_progress_bar=False)
+        vectors = np.array(vectors).astype("float32")
+        logging.info(f"[{batch_len} docs] Encoding complete.")
+
+        logging.info(f"[{batch_len} docs] Adding vectors to FAISS index...")
+        start_index = index.ntotal
+        index.add(vectors)
+        for i, doc_id in enumerate(doc_ids):
+            index_to_id[str(start_index + i)] = doc_id
+        
+        logging.info(f"[{batch_len} docs] Saving FAISS index and ID map to disk...")
+        faiss.write_index(index, faiss_index_path)
+        with open(id_map_path, 'w') as f:
+            json.dump(index_to_id, f)
+        logging.info(f"Successfully saved FAISS index. Total vectors: {index.ntotal}")
+        
+        logging.info(f"[{batch_len} docs] Acknowledging messages...")
+        for tag in delivery_tags:
+            channel.basic_ack(delivery_tag=tag)
+        logging.info(f"Batch of {batch_len} messages processed and acknowledged.")
+
     except Exception as e:
-        print(f"❌ Embedding error at batch {i}-{i + BATCH_SIZE}: {e}")
-        continue
+        logging.error(f"Failed to process batch: {e}", exc_info=True)
+        for tag in delivery_tags:
+            channel.basic_nack(delivery_tag=tag, requeue=False)
+    finally:
+        message_batch = []
 
-    all_embeddings.extend(batch_vectors)
-    all_doc_ids.extend(batch_ids)
-    indexed_doc_ids.update(batch_ids)
+def callback(ch, method, properties, body):
+    """Callback to add messages to the batch."""
+    try:
+        body_str = body.decode('utf-8')
+        message = json.loads(body_str)
+        doc_id = message.get("documentId") # You already fixed this part correctly
+        if doc_id and message.get("content"):
+            logging.info(f"Message for docId {doc_id} added to batch (current batch size: {len(message_batch) + 1})")
+            message_batch.append({'method': method, 'message': message})
+        else:
+            logging.warning(f"Received invalid message, skipping. Content: {message}")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+    except json.JSONDecodeError:
+        logging.error("Failed to decode JSON message. Discarding.", exc_info=True)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
 
-# ✅ Add to FAISS
-os.makedirs(INDEX_DIR, exist_ok=True)
 
-for i in tqdm(range(0, len(all_embeddings), FAISS_ADD_CHUNK), desc="Adding to FAISS index"):
-    chunk_vectors = np.array(all_embeddings[i:i + FAISS_ADD_CHUNK]).astype("float32")
-    index.add(chunk_vectors)
+# --- Main Connection Loop ---
+# ... (The rest of the script is correct and does not need changes)
+while True:
+    try:
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+        channel = connection.channel()
+        channel.queue_declare(queue=QUEUE_NAME, durable=True)
+        channel.basic_qos(prefetch_count=BATCH_SIZE)
+        channel.basic_consume(queue=QUEUE_NAME, on_message_callback=callback)
 
-    for j in range(len(chunk_vectors)):
-        global_index = i + j
-        index_to_id[str(global_index)] = all_doc_ids[global_index]
+        logging.info("Worker started. Waiting for embedding jobs...")
+        last_message_time = time.time()
+        
+        while connection.is_open:
+            connection.process_data_events(time_limit=1)
+            
+            batch_is_full = len(message_batch) >= BATCH_SIZE
+            timeout_reached = (len(message_batch) > 0) and (time.time() - last_message_time > BATCH_TIMEOUT)
 
-# ✅ Save index & mappings
-faiss.write_index(index, f"{INDEX_DIR}/faiss.index")
-with open(f"{INDEX_DIR}/id_map.json", "w") as f:
-    json.dump(index_to_id, f)
+            if batch_is_full or timeout_reached:
+                process_batch()
+                last_message_time = time.time() # Reset timer after processing
+            
+            if len(message_batch) > 0 and 'last_message_time' not in locals():
+                last_message_time = time.time()
 
-print(f"✅ Indexed {len(all_doc_ids)} documents. FAISS total: {index.ntotal}")
-
-# ✅ Save updated index state
-index_state["indexed_doc_ids"] = list(indexed_doc_ids)
-with open(INDEX_STATE_FILE, "w") as f:
-    json.dump(index_state, f)
-
-# ✅ Cleanup
-cur.close()
-conn.close()
-print("✅ Indexing complete.")
+    except pika.exceptions.AMQPConnectionError as e:
+        logging.error(f"Connection failed: {e}. Retrying in 5 seconds...")
+        time.sleep(5)
+    except KeyboardInterrupt:
+        logging.info("Shutdown signal received. Processing final batch...")
+        process_batch()
+        if 'connection' in locals() and connection.is_open:
+            connection.close()
+        break
