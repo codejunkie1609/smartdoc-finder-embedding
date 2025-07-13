@@ -1,10 +1,5 @@
 import debugpy
 
-# Start a debug server on port 5678, accessible from any IP
-debugpy.listen(("0.0.0.0", 5678))
-print("🚀 Debugpy is listening. Waiting for debugger to attach...")
-debugpy.wait_for_client()
-print("✅ Debugger attached.")
 
 import pika
 import json
